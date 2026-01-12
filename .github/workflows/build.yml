@@ -1,0 +1,237 @@
+
+name: Build LineageOS virtio_x86_64(+_tv) on Alice EVO
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      lineage_branch:
+        description: "LineageOS branch"
+        required: true
+        default: "lineage-23.0"
+      product_id:
+        description: "Alice Product/Plan ID"
+        required: true
+        default: "41"
+      os_id:
+        description: "Alice OS ID (Ubuntu 24.04 LTS)"
+        required: true
+        default: "1"
+      hours:
+        description: "Instance lifetime in hours"
+        required: true
+        default: "24"
+      max_retries:
+        description: "Max retry attempts when resources are unavailable"
+        required: true
+        default: "30"
+
+
+permissions:
+  contents: write
+
+jobs:
+  build-on-evo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+
+    env:
+      ALICE_API_BASE: https://app.alice.ws/cli/v1
+      LINEAGE_BRANCH: ${{ github.event.inputs.lineage_branch || 'lineage-23.0' }}
+      PRODUCT_ID: ${{ github.event.inputs.product_id }}
+      OS_ID: ${{ github.event.inputs.os_id }}
+      BUILD_HOURS: ${{ github.event.inputs.hours }}
+      TARGETS: "virtio_x86_64 virtio_x86_64_tv"
+      MAX_RETRIES: ${{ github.event.inputs.max_retries }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare jq/sshpass/nc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq sshpass netcat-openbsd
+
+      - name: Generate first-boot script (install build deps & create user)
+        id: gen_boot_script
+        shell: bash
+        run: |
+          cat > boot.sh <<'EOS'
+          #!/usr/bin/env bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update
+          apt-get install -y git git-lfs curl wget unzip python3 python3-pip \
+              openjdk-11-jdk bc bison build-essential ccache flex g++-multilib gcc-multilib \
+              gperf imagemagick protobuf-compiler python3-protobuf lib32readline-dev lib32z1-dev \
+              libdw-dev libelf-dev libgnutls28-dev lz4 libsdl1.2-dev libssl-dev libxml2 libxml2-utils \
+              lzop pngcrush rsync schedtool squashfs-tools xsltproc zip zlib1g-dev meson glslang-tools python3-mako \
+              sudo
+
+          if ! id user >/dev/null 2>&1; then
+            adduser --disabled-password --gecos "" user
+          fi
+          usermod -aG sudo user
+
+          echo 'user ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/99-user
+          chmod 440 /etc/sudoers.d/99-user
+
+          mkdir -pv /home/user
+          chown -R user /home/user
+ 
+          su - user -c 'mkdir -p ~/bin ~/android/lineage'
+          touch /var/run/alice_boot_done
+          EOS
+          echo "BOOT_SCRIPT=$(base64 -w0 boot.sh)" >> $GITHUB_OUTPUT
+
+
+      - name: Deploy EVO instance with retry on 'no available resources'
+        id: deploy
+        env:
+          ALICE_API_TOKEN: ${{ secrets.ALICE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TARGET_MSG="failed to create server via VirtFusion: no available resources: No hypervisors in the selected group have enough resources."
+
+          BODY=$(jq -n \
+            --arg product_id "${PRODUCT_ID}" \
+            --arg os_id "${OS_ID}" \
+            --arg time "${BUILD_HOURS}" \
+            --arg boot_script "${{ steps.gen_boot_script.outputs.BOOT_SCRIPT }}" \
+            '{product_id: ($product_id|tonumber),
+              os_id: ($os_id|tonumber),
+              time: ($time|tonumber),
+              boot_script: $boot_script}')
+
+          ATTEMPT=0
+          while true; do
+            ATTEMPT=$((ATTEMPT+1))
+            RESP=$(curl --fail -sS -X POST "$ALICE_API_BASE/evo/instances/deploy" \
+              -H "Authorization: Bearer $ALICE_API_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$BODY") || {
+                echo "Deploy HTTP call failed (network/HTTP). Will retry in 60s..."
+                if [ "$ATTEMPT" -ge "${MAX_RETRIES}" ]; then
+                  echo "Max retries (${MAX_RETRIES}) reached. Aborting."
+                  exit 1
+                fi
+                sleep 60
+                continue
+              }
+
+            CODE=$(jq -r '.code // empty' <<<"$RESP")
+            MSG=$(jq -r '.message // empty' <<<"$RESP")
+
+            if [ "$CODE" = "200" ]; then
+              IPV4=$(jq -r '.data.ipv4' <<<"$RESP")
+              PASS=$(jq -r '.data.password' <<<"$RESP")
+              ID=$(jq -r '.data.id' <<<"$RESP")
+
+              echo "::add-mask::$IPV4"
+              echo "::add-mask::$PASS"
+              echo "::add-mask::$ID"
+
+              echo "ip=$IPV4" >> $GITHUB_OUTPUT
+              echo "pass=$PASS" >> $GITHUB_OUTPUT
+              echo "id=$ID" >> $GITHUB_OUTPUT
+
+              echo "Deploy succeeded on attempt ${ATTEMPT}."
+              break
+            fi
+
+            if [ "$CODE" = "400" ] && [ "$MSG" = "$TARGET_MSG" ]; then
+              echo "Resources not available (attempt ${ATTEMPT}/${MAX_RETRIES}). Will retry in 60s..."
+              if [ "$ATTEMPT" -ge "${MAX_RETRIES}" ]; then
+                echo "Max retries (${MAX_RETRIES}) reached due to unavailable resources. Aborting."
+                exit 1
+              fi
+              sleep 60
+              continue
+            else
+              echo "Deploy failed with unexpected error: code=$CODE message=$MSG"
+              exit 1
+            fi
+          done
+
+
+      - name: Wait for SSH to become available (retry)
+        id: wait_ssh
+        run: |
+          set -euo pipefail
+          HOST="${{ steps.deploy.outputs.ip }}"
+          PASS="${{ steps.deploy.outputs.pass }}"
+          echo "Waiting for SSH on ${HOST}:22 ..."
+          for i in $(seq 1 60); do
+            if nc -z -w 2 "$HOST" 22; then
+              echo "Port 22 open; try ssh login ..."
+              if sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o UserKnownHostsFile=/dev/null "root@${HOST}" "echo ok"; then
+                echo "SSH is ready"
+                exit 0
+              fi
+            fi
+            sleep 10
+          done
+          echo "SSH not ready in time"
+          exit 1
+
+
+      - name: Wait for boot_script to finish and user ready
+        id: wait_boot
+        run: |
+          set -euo pipefail
+          HOST="${{ steps.deploy.outputs.ip }}"
+          PASS="${{ steps.deploy.outputs.pass }}"
+          echo "Waiting for first-boot script to finish (marker + user)..."
+          for i in $(seq 1 90); do
+            if sshpass -p "$PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o UserKnownHostsFile=/dev/null "root@${HOST}" \
+              "test -f /var/run/alice_boot_done && id user >/dev/null 2>&1"; then
+              echo "Boot script finished and user is ready."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Boot script not finished in time or user missing"
+          exit 1
+
+      - name: Upload remote build script and run AS user
+        run: |
+          HOST="${{ steps.deploy.outputs.ip }}"
+          PASS="${{ steps.deploy.outputs.pass }}"
+
+          cat > /tmp/remote-build.sh <<'RB'
+          #!/usr/bin/env bash
+          set -euxo pipefail
+          BRANCH="${LINEAGE_BRANCH}"
+          TARGETS="${TARGETS}"
+
+          mkdir -p ~/bin ~/android/lineage
+          curl -L https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          git lfs install || true
+
+          cd ~/android/lineage
+          ~/bin/repo init -u https://github.com/LineageOS/android.git -b "${BRANCH}" --git-lfs --no-clone-bundle
+          ~/bin/repo sync -c -j4
+
+          export USE_CCACHE=1
+          export CCACHE_EXEC=/usr/bin/ccache
+          ccache -M 50G || true
+
+          source build/envsetup.sh
+
+          for T in ${TARGETS}; do
+            breakfast "${T}"
+            m espimage-install -j$(nproc)
+            m isoimage-install -j$(nproc)
+          done
+
+          echo "=== ISO files ==="
+          find ~/android/lineage/out/target/product -name 'lineage-*-UNOFFICIAL-*.iso' -print
+          RB
+
+          sshpass -p "$PASS" scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null /tmp/remote-build.sh "root@${HOST}:/home/user/remote-build.sh"
